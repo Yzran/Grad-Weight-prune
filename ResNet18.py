@@ -9,19 +9,19 @@ import torch.nn.utils.prune as prune
 import torchvision.transforms as transforms
 from torch.quantization.quantize_fx import prepare_fx,convert_fx
 import numpy
-EPOCH = 1           # 训练整批数据多少次, 为了节约时间, 我们只训练一次
+EPOCH = 1
 BATCH_SIZE = 50
-LR = 0.001          # 学习率
-DOWNLOAD_MNIST = False # 如果你已经下载好了mnist数据就写上 False
+LR = 0.001
+DOWNLOAD_MNIST = False
 
 
 # Mnist 手写数字
 train_data = torchvision.datasets.MNIST(
-    root='./mnist/',    # 保存或者提取位置
-    train=True,  # this is training data
+    root='./mnist/',
+    train=True,
     transform=torchvision.transforms.ToTensor(),    # 转换 PIL.Image or numpy.ndarray 成
                                                     # torch.FloatTensor (C x H x W), 训练的时候 normalize 成 [0.0, 1.0] 区间
-    download=DOWNLOAD_MNIST,          # 没下载就下载, 下载了就不用再下了
+    download=DOWNLOAD_MNIST,
 )
 test_data = torchvision.datasets.MNIST(root='./mnist/', train=False)
 

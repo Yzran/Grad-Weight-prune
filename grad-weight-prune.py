@@ -3,7 +3,7 @@ import torch.nn as nn
 import time
 import onnx
 from torch.nn import functional as F
-import torchvision
+import os
 import torch.utils.data as Data
 import torch.nn.utils.prune as prune
 import torchvision.transforms as transforms
@@ -15,7 +15,7 @@ BATCH_SIZE = 50
 LR = 0.001          # 学习率
 DOWNLOAD = False
 
-
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 train_loader = torch.utils.data.DataLoader(datasets.CIFAR10('./data.cifar10', train=True, download=True,
                        transform=transforms.Compose([
                            transforms.Pad(4),
@@ -66,7 +66,7 @@ class ResnetdownBlock(nn.Module):
         return F.relu(extra_x+out)
 
 class ResNet18_prunedable(nn.Module):
-    def __init__(self,config):
+    def __init__(self,config = None):
         super(ResNet18_prunedable,self).__init__()
         if config is None:
             config = [64,64,64,64,64,128,128,128,128,128,256,256,256,256,256,512,512,512,512,512]
@@ -102,9 +102,10 @@ class ResNet18_prunedable(nn.Module):
         return output
 
 
-def train(model,train_dataset,EPOCH,LR):
+def train(model,train_dataset,EPOCH,LR,prune):
     model.train()
-    optimizer = torch.optim.Adam(resnet.parameters(), lr=LR)  # optimize all cnn parameters
+    scale = 50000/BATCH_SIZE
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)  # optimize all cnn parameters
     loss_func = nn.CrossEntropyLoss()
     for epoch in range(EPOCH):
         for step,(x,y) in enumerate(train_dataset):
@@ -114,8 +115,16 @@ def train(model,train_dataset,EPOCH,LR):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
-
+            per = (step/scale) * 100
+            now = '|' * int(per*0.5)
+            total = ' ' * (49 - int(per *0.5))
+            print("\rEPOCH:{} {:^3.0f}%[{}{}]".format(epoch,per, now, total), end='')
+            #time.sleep(0.1)
+        print('\t')
+        test(model,test_loader)
+    if prune == True:
+        newmodel = grad_weight_prune(model,0.5,True)
+        return newmodel
 
 def test(model,test_dataset):
     model.eval()
@@ -127,17 +136,17 @@ def test(model,test_dataset):
         corr += pred.eq(y.data.view_as(pred)).cpu().sum()
     acc = corr / len(test_loader.dataset) *100
     print('model accuracy is {}%'.format(acc))
-    return
 
 def grad_weight_prune(model,prune_percent,cuda):
-    pruned = 0
+
     config = []
     cfg_mask = []
-    l1_list = []
-    mask = []
+
+
     for k, m in enumerate(model.modules()):
         if isinstance(m, nn.Conv2d):
-            weight_copy = m.weight.data.abs().clone()
+            l1_list =[]
+            mask = []
             for i in range(m.weight.shape[0]):
                 weight_l1 = torch.norm(torch.flatten(m.weight[i]),p=1)
                 grad_l1 = torch.norm(torch.flatten(m.weight.grad[i]),p=1)
@@ -147,19 +156,20 @@ def grad_weight_prune(model,prune_percent,cuda):
             l1_copy.sort()
             threshold = l1_copy[int(len(l1_copy)*prune_percent)]
             for i in range(m.weight.shape[0]):
-                if l1_list[i] <= threshold:
+                if l1_list[i] < threshold:
                     mask.append(0)
                 else:
                     mask.append(1)
-            pruned = pruned + mask.shape[0] - torch.sum(mask)
-            m.weight.data.mul_(mask)
-            m.bias.data.mul_(mask)
+            mask = np.array(mask)
+            mask = torch.tensor(mask)
+            print(mask.shape[0])
+            print(m.weight.data.shape)
             config.append(int(torch.sum(mask)))
             cfg_mask.append(mask.clone())
             print('layer index: {:d} \t total channel: {:d} \t remaining channel: {:d}'.
                   format(k, mask.shape[0], int(torch.sum(mask))))
 
-    newmodel = ResNet18_prunedable(cfg=config)
+    newmodel = ResNet18_prunedable(config=config)
     if cuda == True:
         newmodel.cuda()
 
@@ -185,49 +195,51 @@ def grad_weight_prune(model,prune_percent,cuda):
             m1.running_mean = m0.running_mean[idx1.tolist()].clone()
             m1.running_var = m0.running_var[idx1.tolist()].clone()
             #在此处的模型中，bn层始终在卷积层之后，所以bn层后可以更新mask的数据
-            if  isinstance(old_modules[layer_id - 1],nn.Conv2d):
-                layer_id_in_cfg += 1
-                start_mask = end_mask.clone()
-                if layer_id_in_cfg < len(cfg_mask):
-                    end_mask = cfg_mask[layer_id_in_cfg]
+
+            layer_id_in_cfg += 1
+            start_mask = end_mask.clone()
+            if layer_id_in_cfg < len(cfg_mask):
+                end_mask = cfg_mask[layer_id_in_cfg]
 
         elif isinstance(m0, nn.Conv2d):
-            if conv_count == 0:
-                m1.weight.data = m0.weight.data.clone()
-                conv_count += 1
-                continue
+            idx0 = np.squeeze(np.argwhere(np.asarray(start_mask.cpu().numpy())))
+            idx1 = np.squeeze(np.argwhere(np.asarray(end_mask.cpu().numpy())))
+            print('In shape: {:d}, Out shape {:d}.'.format(idx0.size, idx1.size))
+            if idx0.size == 1:
+                idx0 = np.resize(idx0, (1,))
+            if idx1.size == 1:
+                idx1 = np.resize(idx1, (1,))
+            # 根据mask对输入层的卷积核进行剪枝
+            w1 = m0.weight.data[idx1.tolist(),:, :, :].clone()
+            # 因为resnet特有的channel spilt层，所以对这一层进行特殊处理，需要保留上两侧的输入数量，这里只针对resnet18
+            if conv_count ==5 or conv_count ==10 or conv_count ==15:
+                tmplist = idx0.tolist()
+            if conv_count ==7 or conv_count ==12 or conv_count ==17:
+                w1 = w1[:, tmplist, :, :].clone()
             else:
-                conv_count += 1
-                idx0 = np.squeeze(np.argwhere(np.asarray(start_mask.cpu().numpy())))
-                idx1 = np.squeeze(np.argwhere(np.asarray(end_mask.cpu().numpy())))
-                print('In shape: {:d}, Out shape {:d}.'.format(idx0.size, idx1.size))
-                if idx0.size == 1:
-                    idx0 = np.resize(idx0, (1,))
-                if idx1.size == 1:
-                    idx1 = np.resize(idx1, (1,))
-                # 根据mask对输入层的卷积核进行剪枝
-                w1 = m0.weight.data[:, idx0.tolist(), :, :].clone()
-                # 因为resnet特有的channel spilt层，所以对这一层进行特殊处理，需要保留上两侧的输入数量，这里只针对resnet18
-                if conv_count ==5 or conv_count ==10 or conv_count ==15:
-                    tmplist = idx1.tolist()
-                if conv_count ==7 or conv_count ==12 or conv_count ==17:
-                    w1 = w1[tmplist, :, :, :].clone()
-                else:
-                    w1 = w1[idx1.tolist(),:,:,:]
-                m1.weight.data = w1.clone()
-                continue
+                w1 = w1[:,idx0.tolist(),:,:]
+            m1.weight.data = w1.clone()
+            conv_count += 1
+            continue
 
             #将新参数复制给newmodel
             m1.weight.data = m0.weight.data.clone()
     # 保存config数据，使得下次可以直接读取权重文件
-    np.save('config.npy',config)
+    np.save('config{}.npy'.format(prune_percent),config)
     # 保存权重文件
-    torch.save(newmodel.state_dict(),'resnet18_cifar10_{}pruned'.format(prune_percent))
+    torch.save(newmodel.state_dict(),'resnet18_cifar10_{}pruned.pth'.format(prune_percent))
     return newmodel
 
 resnet =ResNet18_prunedable()
 resnet.cuda()
-train(resnet,train_loader,10,0.001)
-torch.save(resnet.state_dict(),'resnet18_cifar10.pth')
-resnet_pruned = ResNet18_prunedable()
-#resnet_pruned.load_state_dict(torch.load())
+#train(resnet,train_loader,10,0.001)
+#torch.save(resnet.state_dict(),'resnet18_cifar10.pth')
+resnet.load_state_dict(torch.load('resnet18_cifar10.pth'))
+# train(resnet,train_loader,1,LR,True)
+saved_config = np.load('config0.5.npy')
+print(saved_config)
+resnet_pruned = ResNet18_prunedable(config=saved_config)
+resnet_pruned.cuda()
+resnet_pruned.load_state_dict(torch.load('resnet18_cifar10_0.5pruned.pth'))
+train(resnet_pruned,train_loader,50,0.001,False)
+torch.save(resnet_pruned.state_dict(),'resnet18_cifar10_0.5pruned.pth')
